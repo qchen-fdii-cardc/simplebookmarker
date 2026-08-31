@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::Parser;
-use lopdf::{Bookmark, Document, ObjectId};
+use lopdf::{Bookmark, Document, Object, ObjectId};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -129,7 +129,11 @@ fn parse_entries(contents: &str, max_page: u32) -> Vec<Entry> {
         .collect()
 }
 
-fn add_bookmarks(document: &mut Document, entries: Vec<Entry>, pages: &BTreeMap<u32, ObjectId>) {
+fn add_bookmarks(
+    document: &mut Document,
+    entries: Vec<Entry>,
+    pages: &BTreeMap<u32, ObjectId>,
+) -> lopdf::Result<()> {
     let mut parents: Vec<u32> = Vec::new();
 
     for entry in entries {
@@ -144,7 +148,13 @@ fn add_bookmarks(document: &mut Document, entries: Vec<Entry>, pages: &BTreeMap<
         parents.push(bookmark_id);
     }
 
-    document.build_outline();
+    if let Some(outline_id) = document.build_outline() {
+        document
+            .catalog_mut()?
+            .set("Outlines", Object::Reference(outline_id));
+    }
+
+    Ok(())
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
@@ -154,7 +164,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let max_page = pages.keys().copied().max().unwrap_or(0);
     let contents = fs::read_to_string(&paths.bookmarks)?;
     let entries = parse_entries(&contents, max_page);
-    add_bookmarks(&mut document, entries, &pages);
+    add_bookmarks(&mut document, entries, &pages)?;
     document.save(&paths.output)?;
     println!("Wrote {}", paths.output.display());
     Ok(())
@@ -170,6 +180,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
     #[test]
     fn parses_supported_formats_and_filters_invalid_entries() {
@@ -207,5 +218,70 @@ mod tests {
         assert_eq!(paths.input, PathBuf::from("book.pdf"));
         assert_eq!(paths.bookmarks, PathBuf::from("book.txt"));
         assert_eq!(paths.output, PathBuf::from("book_bm.pdf"));
+    }
+
+    #[test]
+    fn writes_visible_nested_outlines() {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let page_ids: Vec<Object> = (0..2)
+            .map(|_| {
+                document
+                    .add_object(dictionary! {
+                        "Type" => "Page",
+                        "Parent" => pages_id,
+                        "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                    })
+                    .into()
+            })
+            .collect();
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => page_ids,
+                "Count" => 2,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        let pages = document.get_pages();
+        add_bookmarks(
+            &mut document,
+            vec![
+                Entry {
+                    page: 1,
+                    title: "Parent".to_string(),
+                    depth: 0,
+                },
+                Entry {
+                    page: 2,
+                    title: "Child".to_string(),
+                    depth: 1,
+                },
+            ],
+            &pages,
+        )
+        .unwrap();
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        let loaded = Document::load_mem(&bytes).unwrap();
+        let outline_id = loaded
+            .catalog()
+            .unwrap()
+            .get(b"Outlines")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let outline = loaded.get_object(outline_id).unwrap().as_dict().unwrap();
+        assert_eq!(outline.get(b"Count").unwrap().as_i64().unwrap(), 1);
+        let first_id = outline.get(b"First").unwrap().as_reference().unwrap();
+        let first = loaded.get_object(first_id).unwrap().as_dict().unwrap();
+        assert!(first.get(b"First").is_ok());
     }
 }

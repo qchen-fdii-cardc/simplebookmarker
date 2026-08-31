@@ -1,6 +1,6 @@
 [package]
 name = "simplebookmarker"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Add PDF bookmarks from a simple indented text file"
 license = "MIT"

@@ -47,3 +47,15 @@ entry is attached at the deepest available level.
 ## License
 
 MIT
+
+## Release process
+
+Run the **Bump version** workflow from GitHub Actions and choose `patch`,
+`minor`, or `major`. The workflow updates `Cargo.toml` and `Cargo.lock`, runs
+all checks, commits the new version to `main`, and pushes a matching `vX.Y.Z`
+tag.
+
+Create and publish a GitHub Release from that tag. The **Publish to crates.io**
+workflow verifies that the tag matches the Cargo package version, runs the
+tests, and publishes using the `CARGO_REGISTRY_TOKEN` secret in the `crates.io`
+environment.

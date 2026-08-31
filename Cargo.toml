@@ -1,0 +1,14 @@
+[package]
+name = "simplebookmarker"
+version = "0.1.0"
+edition = "2024"
+description = "Add PDF bookmarks from a simple indented text file"
+license = "MIT"
+readme = "README.md"
+keywords = ["pdf", "bookmark", "outline", "cli"]
+categories = ["command-line-utilities"]
+exclude = ["target/", "*.pdf", "bookmarks.txt"]
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+lopdf = "0.44.0"

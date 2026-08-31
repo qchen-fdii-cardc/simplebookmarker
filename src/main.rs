@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn resolves_default_paths() {
-        let paths = Cli::try_parse_from(["simplebookmarker", "book"])
+        let paths = Cli::try_parse_from(["sbm", "book"])
             .unwrap()
             .paths()
             .unwrap();

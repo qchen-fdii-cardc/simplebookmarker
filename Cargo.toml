@@ -9,6 +9,10 @@ keywords = ["pdf", "bookmark", "outline", "cli"]
 categories = ["command-line-utilities"]
 exclude = ["target/", "*.pdf", "bookmarks.txt"]
 
+[[bin]]
+name = "sbm"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 lopdf = "0.44.0"

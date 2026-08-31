@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use lopdf::{Bookmark, Document, Object, ObjectId};
+use tempfile::NamedTempFile;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -23,6 +24,10 @@ struct Cli {
     /// Output PDF file (defaults to NAME_bm.pdf)
     #[arg(short, long, value_name = "PDF")]
     output: Option<PathBuf>,
+
+    /// Replace the input PDF instead of creating a new file
+    #[arg(long, visible_alias = "inplace", conflicts_with = "output")]
+    in_place: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -49,20 +54,24 @@ impl Cli {
             .bookmarks
             .or_else(|| base.map(|name| PathBuf::from(format!("{name}.txt"))))
             .ok_or("provide NAME or --bookmarks")?;
-        let output = self.output.unwrap_or_else(|| {
-            base.map(|name| PathBuf::from(format!("{name}_bm.pdf")))
-                .unwrap_or_else(|| {
-                    let mut path = input.clone();
-                    let stem = input
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("output");
-                    path.set_file_name(format!("{stem}_bm.pdf"));
-                    path
-                })
-        });
+        let output = if self.in_place {
+            input.clone()
+        } else {
+            self.output.unwrap_or_else(|| {
+                base.map(|name| PathBuf::from(format!("{name}_bm.pdf")))
+                    .unwrap_or_else(|| {
+                        let mut path = input.clone();
+                        let stem = input
+                            .file_stem()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("output");
+                        path.set_file_name(format!("{stem}_bm.pdf"));
+                        path
+                    })
+            })
+        };
 
-        if input == output {
+        if !self.in_place && input == output {
             return Err("input and output files must be different".to_string());
         }
 
@@ -72,6 +81,27 @@ impl Cli {
             output,
         })
     }
+}
+
+fn save_document(
+    document: &mut Document,
+    input: &Path,
+    output: &Path,
+) -> Result<(), Box<dyn Error>> {
+    if input != output {
+        document.save(output)?;
+        return Ok(());
+    }
+
+    let target = fs::canonicalize(input)?;
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let permissions = fs::metadata(&target)?.permissions();
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    temporary.as_file().set_permissions(permissions)?;
+    document.save_to(temporary.as_file_mut())?;
+    temporary.as_file_mut().sync_all()?;
+    temporary.persist(target)?;
+    Ok(())
 }
 
 fn indentation(line: &str) -> Option<(usize, &str)> {
@@ -165,7 +195,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let contents = fs::read_to_string(&paths.bookmarks)?;
     let entries = parse_entries(&contents, max_page);
     add_bookmarks(&mut document, entries, &pages)?;
-    document.save(&paths.output)?;
+    save_document(&mut document, &paths.input, &paths.output)?;
     println!("Wrote {}", paths.output.display());
     Ok(())
 }
@@ -221,6 +251,25 @@ mod tests {
     }
 
     #[test]
+    fn resolves_in_place_output_and_rejects_explicit_output() {
+        let paths = Cli::try_parse_from(["sbm", "book", "--in-place"])
+            .unwrap()
+            .paths()
+            .unwrap();
+
+        assert_eq!(paths.input, PathBuf::from("book.pdf"));
+        assert_eq!(paths.output, PathBuf::from("book.pdf"));
+        assert!(
+            Cli::try_parse_from(["sbm", "book", "--inplace"])
+                .unwrap()
+                .in_place
+        );
+        assert!(
+            Cli::try_parse_from(["sbm", "book", "--in-place", "--output", "other.pdf"]).is_err()
+        );
+    }
+
+    #[test]
     fn writes_visible_nested_outlines() {
         let mut document = Document::with_version("1.5");
         let pages_id = document.new_object_id();
@@ -268,9 +317,11 @@ mod tests {
         )
         .unwrap();
 
-        let mut bytes = Vec::new();
-        document.save_to(&mut bytes).unwrap();
-        let loaded = Document::load_mem(&bytes).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let pdf_path = directory.path().join("book.pdf");
+        fs::write(&pdf_path, b"placeholder").unwrap();
+        save_document(&mut document, &pdf_path, &pdf_path).unwrap();
+        let loaded = Document::load(&pdf_path).unwrap();
         let outline_id = loaded
             .catalog()
             .unwrap()
@@ -283,5 +334,6 @@ mod tests {
         let first_id = outline.get(b"First").unwrap().as_reference().unwrap();
         let first = loaded.get_object(first_id).unwrap().as_dict().unwrap();
         assert!(first.get(b"First").is_ok());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

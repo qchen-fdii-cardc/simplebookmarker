@@ -19,6 +19,16 @@ sbm book
 
 The result is written to `book_bm.pdf`.
 
+To replace `book.pdf` atomically instead of creating a new file, run:
+
+```console
+sbm book --in-place
+```
+
+`--inplace` is also accepted. In-place mode writes and syncs a temporary file
+in the same directory before replacing the original PDF. It cannot be combined
+with `--output`.
+
 Input, bookmark, and output paths can also be set explicitly:
 
 ```console

@@ -29,6 +29,23 @@ sbm book --in-place
 in the same directory before replacing the original PDF. It cannot be combined
 with `--output`.
 
+Existing PDF bookmarks are preserved. When an input entry points to a page that
+already has a bookmark, the default behavior is to create another bookmark:
+
+```console
+sbm book --on-existing create
+```
+
+To update the title of an existing bookmark on the same page instead, use:
+
+```console
+sbm book --on-existing update
+```
+
+Update mode matches existing same-page bookmarks once each, in document order.
+It keeps their hierarchy and changes only their titles. If no unmatched
+bookmark exists on that page, a new bookmark is created.
+
 Input, bookmark, and output paths can also be set explicitly:
 
 ```console

@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use lopdf::{Bookmark, Document, Object, ObjectId};
 use tempfile::NamedTempFile;
 
@@ -28,9 +28,20 @@ struct Cli {
     /// Replace the input PDF instead of creating a new file
     #[arg(long, visible_alias = "inplace", conflicts_with = "output")]
     in_place: bool,
+
+    /// How to handle an existing bookmark on the same page
+    #[arg(long, value_enum, default_value_t = ExistingPolicy::Create)]
+    on_existing: ExistingPolicy,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum ExistingPolicy {
+    #[default]
+    Create,
+    Update,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Entry {
     page: u32,
     title: String,
@@ -159,22 +170,89 @@ fn parse_entries(contents: &str, max_page: u32) -> Vec<Entry> {
         .collect()
 }
 
-fn add_bookmarks(
+fn existing_entries(document: &Document) -> lopdf::Result<Vec<Entry>> {
+    match document.get_toc() {
+        Ok(toc) => Ok(toc
+            .toc
+            .into_iter()
+            .map(|item| Entry {
+                page: item.page as u32,
+                title: item.title,
+                depth: item.level.saturating_sub(1),
+            })
+            .collect()),
+        Err(lopdf::Error::NoOutline) => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn append_entries(
     document: &mut Document,
-    entries: Vec<Entry>,
+    entries: &[Entry],
     pages: &BTreeMap<u32, ObjectId>,
-) -> lopdf::Result<()> {
+) -> Vec<Option<u32>> {
     let mut parents: Vec<u32> = Vec::new();
+    let mut bookmark_ids = Vec::with_capacity(entries.len());
 
     for entry in entries {
+        let Some(&page_id) = pages.get(&entry.page) else {
+            bookmark_ids.push(None);
+            continue;
+        };
+        let depth = entry.depth.min(parents.len());
+        parents.truncate(depth);
+        let parent = depth.checked_sub(1).map(|index| parents[index]);
+        let bookmark = Bookmark::new(entry.title.clone(), [0.0, 0.0, 0.0], 0, page_id);
+        let bookmark_id = document.add_bookmark(bookmark, parent);
+        parents.push(bookmark_id);
+        bookmark_ids.push(Some(bookmark_id));
+    }
+
+    bookmark_ids
+}
+
+fn add_bookmarks(
+    document: &mut Document,
+    mut existing: Vec<Entry>,
+    entries: Vec<Entry>,
+    pages: &BTreeMap<u32, ObjectId>,
+    policy: ExistingPolicy,
+) -> lopdf::Result<()> {
+    let mut matches = vec![None; entries.len()];
+    if policy == ExistingPolicy::Update {
+        let mut used = vec![false; existing.len()];
+        for (entry_index, entry) in entries.iter().enumerate() {
+            if let Some(existing_index) =
+                existing
+                    .iter()
+                    .enumerate()
+                    .position(|(index, existing_entry)| {
+                        !used[index] && existing_entry.page == entry.page
+                    })
+            {
+                existing[existing_index].title = entry.title.clone();
+                used[existing_index] = true;
+                matches[entry_index] = Some(existing_index);
+            }
+        }
+    }
+
+    let existing_ids = append_entries(document, &existing, pages);
+    let mut parents: Vec<u32> = Vec::new();
+
+    for (entry_index, entry) in entries.into_iter().enumerate() {
         let Some(&page_id) = pages.get(&entry.page) else {
             continue;
         };
         let depth = entry.depth.min(parents.len());
         parents.truncate(depth);
         let parent = depth.checked_sub(1).map(|index| parents[index]);
-        let bookmark = Bookmark::new(entry.title, [0.0, 0.0, 0.0], 0, page_id);
-        let bookmark_id = document.add_bookmark(bookmark, parent);
+        let bookmark_id = matches[entry_index]
+            .and_then(|index| existing_ids[index])
+            .unwrap_or_else(|| {
+                let bookmark = Bookmark::new(entry.title, [0.0, 0.0, 0.0], 0, page_id);
+                document.add_bookmark(bookmark, parent)
+            });
         parents.push(bookmark_id);
     }
 
@@ -188,13 +266,16 @@ fn add_bookmarks(
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let paths = Cli::parse().paths()?;
+    let cli = Cli::parse();
+    let policy = cli.on_existing;
+    let paths = cli.paths()?;
     let mut document = Document::load(&paths.input)?;
     let pages = document.get_pages();
     let max_page = pages.keys().copied().max().unwrap_or(0);
+    let existing = existing_entries(&document)?;
     let contents = fs::read_to_string(&paths.bookmarks)?;
     let entries = parse_entries(&contents, max_page);
-    add_bookmarks(&mut document, entries, &pages)?;
+    add_bookmarks(&mut document, existing, entries, &pages, policy)?;
     save_document(&mut document, &paths.input, &paths.output)?;
     println!("Wrote {}", paths.output.display());
     Ok(())
@@ -267,10 +348,19 @@ mod tests {
         assert!(
             Cli::try_parse_from(["sbm", "book", "--in-place", "--output", "other.pdf"]).is_err()
         );
+        assert_eq!(
+            Cli::try_parse_from(["sbm", "book"]).unwrap().on_existing,
+            ExistingPolicy::Create
+        );
+        assert_eq!(
+            Cli::try_parse_from(["sbm", "book", "--on-existing", "update"])
+                .unwrap()
+                .on_existing,
+            ExistingPolicy::Update
+        );
     }
 
-    #[test]
-    fn writes_visible_nested_outlines() {
+    fn two_page_document() -> Document {
         let mut document = Document::with_version("1.5");
         let pages_id = document.new_object_id();
         let page_ids: Vec<Object> = (0..2)
@@ -297,10 +387,44 @@ mod tests {
             "Pages" => pages_id,
         });
         document.trailer.set("Root", catalog_id);
+        document
+    }
+
+    fn document_with_existing_outlines() -> Document {
+        let mut document = two_page_document();
+        let pages = document.get_pages();
+        add_bookmarks(
+            &mut document,
+            Vec::new(),
+            vec![
+                Entry {
+                    page: 1,
+                    title: "Old parent".to_string(),
+                    depth: 0,
+                },
+                Entry {
+                    page: 2,
+                    title: "Old child".to_string(),
+                    depth: 1,
+                },
+            ],
+            &pages,
+            ExistingPolicy::Create,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        Document::load_mem(&bytes).unwrap()
+    }
+
+    #[test]
+    fn writes_visible_nested_outlines() {
+        let mut document = two_page_document();
 
         let pages = document.get_pages();
         add_bookmarks(
             &mut document,
+            Vec::new(),
             vec![
                 Entry {
                     page: 1,
@@ -314,6 +438,7 @@ mod tests {
                 },
             ],
             &pages,
+            ExistingPolicy::Create,
         )
         .unwrap();
 
@@ -335,5 +460,58 @@ mod tests {
         let first = loaded.get_object(first_id).unwrap().as_dict().unwrap();
         assert!(first.get(b"First").is_ok());
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn updates_the_title_of_an_existing_same_page_bookmark() {
+        let mut document = document_with_existing_outlines();
+        let pages = document.get_pages();
+        let existing = existing_entries(&document).unwrap();
+
+        add_bookmarks(
+            &mut document,
+            existing,
+            vec![Entry {
+                page: 1,
+                title: "New parent".to_string(),
+                depth: 0,
+            }],
+            &pages,
+            ExistingPolicy::Update,
+        )
+        .unwrap();
+
+        let toc = document.get_toc().unwrap().toc;
+        assert_eq!(toc.len(), 2);
+        assert_eq!(toc[0].title, "New parent");
+        assert_eq!(toc[0].level, 1);
+        assert_eq!(toc[1].title, "Old child");
+        assert_eq!(toc[1].level, 2);
+    }
+
+    #[test]
+    fn creates_a_new_bookmark_when_the_same_page_already_exists() {
+        let mut document = document_with_existing_outlines();
+        let pages = document.get_pages();
+        let existing = existing_entries(&document).unwrap();
+
+        add_bookmarks(
+            &mut document,
+            existing,
+            vec![Entry {
+                page: 1,
+                title: "New parent".to_string(),
+                depth: 0,
+            }],
+            &pages,
+            ExistingPolicy::Create,
+        )
+        .unwrap();
+
+        let toc = document.get_toc().unwrap().toc;
+        assert_eq!(toc.len(), 3);
+        assert!(toc.iter().any(|item| item.title == "Old parent"));
+        assert!(toc.iter().any(|item| item.title == "New parent"));
+        assert!(toc.iter().any(|item| item.title == "Old child"));
     }
 }

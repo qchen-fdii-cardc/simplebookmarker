@@ -37,6 +37,7 @@
 - [ ] Test default paths with `sbm NAME` using a representative PDF and bookmark file.
 - [ ] Test explicit `--input`, `--bookmarks`, and `--output` paths.
 - [ ] Test `--in-place` replacement and confirm it conflicts with `--output`.
+- [ ] Test both `--on-existing create` and `--on-existing update` with same-page bookmarks.
 - [ ] Open the generated PDF in a reader and verify titles, pages, nesting, and output readability.
 - [ ] Test malformed lines, page zero, pages beyond the PDF, tabs, four-space indentation, and skipped levels.
 - [ ] Confirm the input PDF is unchanged and the output path is correct.

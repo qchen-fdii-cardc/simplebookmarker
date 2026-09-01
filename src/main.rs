@@ -7,6 +7,8 @@ use clap::{Parser, ValueEnum};
 use lopdf::{Bookmark, Document, Object, ObjectId};
 use tempfile::NamedTempFile;
 
+const DEFAULT_EXPORT_PATH: &str = "__sbm_default_export_path__";
+
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -28,6 +30,14 @@ struct Cli {
     /// Replace the input PDF instead of creating a new file
     #[arg(long, visible_alias = "inplace", conflicts_with = "output")]
     in_place: bool,
+
+    /// Parse and report bookmark entries without writing the PDF
+    #[arg(long, conflicts_with = "export")]
+    dry_run: bool,
+
+    /// Export existing PDF bookmarks to a text file (defaults to NAME.txt)
+    #[arg(long, value_name = "TEXT", num_args = 0..=1, default_missing_value = DEFAULT_EXPORT_PATH)]
+    export: Option<Option<PathBuf>>,
 
     /// How to handle an existing bookmark on the same page
     #[arg(long, value_enum, default_value_t = ExistingPolicy::Create)]
@@ -54,22 +64,46 @@ struct Paths {
     output: PathBuf,
 }
 
+struct ExportPaths {
+    input: PathBuf,
+    output: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParseReport {
+    entries: Vec<Entry>,
+    blank_lines: usize,
+    malformed_lines: Vec<usize>,
+    out_of_range_lines: Vec<(usize, u32)>,
+}
+
 impl Cli {
-    fn paths(self) -> Result<Paths, String> {
+    fn input_path(&self) -> Result<PathBuf, String> {
         let base = self.name.as_deref();
-        let input = self
-            .input
+        self.input
+            .clone()
             .or_else(|| base.map(|name| PathBuf::from(format!("{name}.pdf"))))
-            .ok_or("provide NAME or --input")?;
-        let bookmarks = self
-            .bookmarks
+            .ok_or("provide NAME or --input".to_string())
+    }
+
+    fn bookmark_path(&self) -> Result<PathBuf, String> {
+        let base = self.name.as_deref();
+        self.bookmarks
+            .clone()
             .or_else(|| base.map(|name| PathBuf::from(format!("{name}.txt"))))
-            .ok_or("provide NAME or --bookmarks")?;
+            .ok_or("provide NAME or --bookmarks".to_string())
+    }
+
+    fn paths(&self) -> Result<Paths, String> {
+        let input = self.input_path()?;
+        let bookmarks = self.bookmark_path()?;
         let output = if self.in_place {
             input.clone()
         } else {
-            self.output.unwrap_or_else(|| {
-                base.map(|name| PathBuf::from(format!("{name}_bm.pdf")))
+            self.output.clone().unwrap_or_else(|| {
+                self.name
+                    .as_deref()
+                    .map(|name| PathBuf::from(format!("{name}_bm.pdf")))
                     .unwrap_or_else(|| {
                         let mut path = input.clone();
                         let stem = input
@@ -92,6 +126,24 @@ impl Cli {
             output,
         })
     }
+
+    fn export_paths(&self) -> Result<ExportPaths, String> {
+        let input = self.input_path()?;
+        let output = match &self.export {
+            Some(Some(path)) if path == Path::new(DEFAULT_EXPORT_PATH) => text_path_for_pdf(&input),
+            Some(Some(path)) => path.clone(),
+            Some(None) => text_path_for_pdf(&input),
+            None => return Err("provide --export to export bookmarks".to_string()),
+        };
+
+        Ok(ExportPaths { input, output })
+    }
+}
+
+fn text_path_for_pdf(input: &Path) -> PathBuf {
+    let mut output = input.to_path_buf();
+    output.set_extension("txt");
+    output
 }
 
 fn save_document(
@@ -163,11 +215,41 @@ fn parse_line(line: &str) -> Option<Entry> {
 }
 
 fn parse_entries(contents: &str, max_page: u32) -> Vec<Entry> {
+    analyze_entries(contents, max_page).entries
+}
+
+fn analyze_entries(contents: &str, max_page: u32) -> ParseReport {
+    let mut report = ParseReport {
+        entries: Vec::new(),
+        blank_lines: 0,
+        malformed_lines: Vec::new(),
+        out_of_range_lines: Vec::new(),
+    };
+
+    for (line_index, line) in contents.lines().enumerate() {
+        let line_number = line_index + 1;
+        if line.trim().is_empty() {
+            report.blank_lines += 1;
+            continue;
+        }
+
+        match parse_line(line) {
+            Some(entry) if entry.page <= max_page => report.entries.push(entry),
+            Some(entry) => report.out_of_range_lines.push((line_number, entry.page)),
+            None => report.malformed_lines.push(line_number),
+        }
+    }
+
+    report
+}
+
+fn format_entries(entries: &[Entry]) -> String {
+    let mut contents = String::new();
+    for entry in entries {
+        contents.push_str(&"    ".repeat(entry.depth));
+        contents.push_str(&format!("{}-{}\n", entry.page, entry.title));
+    }
     contents
-        .lines()
-        .filter_map(parse_line)
-        .filter(|entry| entry.page <= max_page)
-        .collect()
 }
 
 fn existing_entries(document: &Document) -> lopdf::Result<Vec<Entry>> {
@@ -265,16 +347,76 @@ fn add_bookmarks(
     Ok(())
 }
 
+fn print_dry_run_report(
+    paths: &Paths,
+    max_page: u32,
+    existing_count: usize,
+    report: &ParseReport,
+    policy: ExistingPolicy,
+) {
+    println!("Dry run: no PDF will be written");
+    println!("Input PDF: {}", paths.input.display());
+    println!("Bookmark text: {}", paths.bookmarks.display());
+    println!("PDF pages: {max_page}");
+    println!("Existing PDF bookmarks: {existing_count}");
+    println!("Existing bookmark policy: {policy:?}");
+    if paths.input == paths.output {
+        println!("Would replace input PDF: {}", paths.input.display());
+    } else {
+        println!("Would write PDF: {}", paths.output.display());
+    }
+    println!("Valid entries: {}", report.entries.len());
+    for entry in &report.entries {
+        println!(
+            "  page {} depth {} title {}",
+            entry.page, entry.depth, entry.title
+        );
+    }
+    println!("Blank lines: {}", report.blank_lines);
+    println!("Malformed lines: {}", report.malformed_lines.len());
+    for line_number in &report.malformed_lines {
+        println!("  line {line_number}: malformed or unsupported indentation");
+    }
+    println!("Out-of-range entries: {}", report.out_of_range_lines.len());
+    for (line_number, page) in &report.out_of_range_lines {
+        println!("  line {line_number}: page {page} is outside 1..={max_page}");
+    }
+}
+
+fn export_bookmarks(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+    let document = Document::load(input)?;
+    let entries = existing_entries(&document)?;
+    fs::write(output, format_entries(&entries))?;
+    println!(
+        "Exported {} bookmark(s) to {}",
+        entries.len(),
+        output.display()
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    if cli.export.is_some() {
+        let paths = cli.export_paths()?;
+        return export_bookmarks(&paths.input, &paths.output);
+    }
+
     let policy = cli.on_existing;
+    let dry_run = cli.dry_run;
     let paths = cli.paths()?;
     let mut document = Document::load(&paths.input)?;
     let pages = document.get_pages();
     let max_page = pages.keys().copied().max().unwrap_or(0);
     let existing = existing_entries(&document)?;
     let contents = fs::read_to_string(&paths.bookmarks)?;
-    let entries = parse_entries(&contents, max_page);
+    let report = analyze_entries(&contents, max_page);
+    if dry_run {
+        print_dry_run_report(&paths, max_page, existing.len(), &report, policy);
+        return Ok(());
+    }
+
+    let entries = report.entries;
     add_bookmarks(&mut document, existing, entries, &pages, policy)?;
     save_document(&mut document, &paths.input, &paths.output)?;
     println!("Wrote {}", paths.output.display());
@@ -320,6 +462,51 @@ mod tests {
     }
 
     #[test]
+    fn reports_entry_parse_details_for_dry_run() {
+        let contents = "1-Parent\n\n    2-Child\n3-Too far\n  bad indent";
+
+        assert_eq!(
+            analyze_entries(contents, 2),
+            ParseReport {
+                entries: vec![
+                    Entry {
+                        page: 1,
+                        title: "Parent".to_string(),
+                        depth: 0,
+                    },
+                    Entry {
+                        page: 2,
+                        title: "Child".to_string(),
+                        depth: 1,
+                    },
+                ],
+                blank_lines: 1,
+                malformed_lines: vec![5],
+                out_of_range_lines: vec![(4, 3)],
+            }
+        );
+    }
+
+    #[test]
+    fn formats_entries_with_existing_bookmark_syntax() {
+        assert_eq!(
+            format_entries(&[
+                Entry {
+                    page: 1,
+                    title: "Parent".to_string(),
+                    depth: 0,
+                },
+                Entry {
+                    page: 2,
+                    title: "Child".to_string(),
+                    depth: 1,
+                },
+            ]),
+            "1-Parent\n    2-Child\n"
+        );
+    }
+
+    #[test]
     fn resolves_default_paths() {
         let paths = Cli::try_parse_from(["sbm", "book"])
             .unwrap()
@@ -329,6 +516,34 @@ mod tests {
         assert_eq!(paths.input, PathBuf::from("book.pdf"));
         assert_eq!(paths.bookmarks, PathBuf::from("book.txt"));
         assert_eq!(paths.output, PathBuf::from("book_bm.pdf"));
+    }
+
+    #[test]
+    fn resolves_export_paths() {
+        let paths = Cli::try_parse_from(["sbm", "book", "--export"])
+            .unwrap()
+            .export_paths()
+            .unwrap();
+
+        assert_eq!(paths.input, PathBuf::from("book.pdf"));
+        assert_eq!(paths.output, PathBuf::from("book.txt"));
+
+        let paths = Cli::try_parse_from(["sbm", "--input", "source.pdf", "--export"])
+            .unwrap()
+            .export_paths()
+            .unwrap();
+
+        assert_eq!(paths.input, PathBuf::from("source.pdf"));
+        assert_eq!(paths.output, PathBuf::from("source.txt"));
+
+        let paths = Cli::try_parse_from(["sbm", "book", "--export", "out.txt"])
+            .unwrap()
+            .export_paths()
+            .unwrap();
+
+        assert_eq!(paths.input, PathBuf::from("book.pdf"));
+        assert_eq!(paths.output, PathBuf::from("out.txt"));
+        assert!(Cli::try_parse_from(["sbm", "book", "--dry-run", "--export"]).is_err());
     }
 
     #[test]

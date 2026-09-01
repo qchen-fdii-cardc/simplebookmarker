@@ -29,6 +29,30 @@ sbm book --in-place
 in the same directory before replacing the original PDF. It cannot be combined
 with `--output`.
 
+To check the bookmark text without writing a PDF, run:
+
+```console
+sbm book --dry-run
+```
+
+Dry-run mode loads the PDF, parses the bookmark text, reports valid entries,
+blank lines, malformed lines, and out-of-range page numbers, then exits without
+modifying or writing any PDF.
+
+To export existing PDF bookmarks back to the text format, run:
+
+```console
+sbm book --export
+```
+
+This writes `book.txt` by default. To choose the exported bookmark file, pass a
+path after `--export`. When only `--input` is used, the default export path is
+the input PDF path with a `.txt` extension.
+
+```console
+sbm book --export existing-bookmarks.txt
+```
+
 Existing PDF bookmarks are preserved. When an input entry points to a page that
 already has a bookmark, the default behavior is to create another bookmark:
 

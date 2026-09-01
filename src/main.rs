@@ -214,10 +214,6 @@ fn parse_line(line: &str) -> Option<Entry> {
     })
 }
 
-fn parse_entries(contents: &str, max_page: u32) -> Vec<Entry> {
-    analyze_entries(contents, max_page).entries
-}
-
 fn analyze_entries(contents: &str, max_page: u32) -> ParseReport {
     let mut report = ParseReport {
         entries: Vec::new(),
@@ -440,7 +436,7 @@ mod tests {
         let contents = "20 ONE\n    22-Child\n\t23 - Tab child\n  24 bad indent\n0 zero\n101 too far\nnot an entry";
 
         assert_eq!(
-            parse_entries(contents, 100),
+            analyze_entries(contents, 100).entries,
             vec![
                 Entry {
                     page: 20,

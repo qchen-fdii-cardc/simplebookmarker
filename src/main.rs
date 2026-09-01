@@ -39,9 +39,13 @@ struct Cli {
     #[arg(long, value_name = "TEXT", num_args = 0..=1, default_missing_value = DEFAULT_EXPORT_PATH)]
     export: Option<Option<PathBuf>>,
 
+    /// Discard all existing PDF bookmarks before adding new ones
+    #[arg(long, conflicts_with_all = ["export", "on_existing"])]
+    from_zero: bool,
+
     /// How to handle an existing bookmark on the same page
-    #[arg(long, value_enum, default_value_t = ExistingPolicy::Create)]
-    on_existing: ExistingPolicy,
+    #[arg(long, value_enum)]
+    on_existing: Option<ExistingPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -137,6 +141,14 @@ impl Cli {
         };
 
         Ok(ExportPaths { input, output })
+    }
+
+    fn existing_policy(&self) -> ExistingPolicy {
+        self.on_existing.unwrap_or(if self.in_place {
+            ExistingPolicy::Update
+        } else {
+            ExistingPolicy::Create
+        })
     }
 }
 
@@ -349,13 +361,18 @@ fn print_dry_run_report(
     existing_count: usize,
     report: &ParseReport,
     policy: ExistingPolicy,
+    from_zero: bool,
 ) {
     println!("Dry run: no PDF will be written");
     println!("Input PDF: {}", paths.input.display());
     println!("Bookmark text: {}", paths.bookmarks.display());
     println!("PDF pages: {max_page}");
     println!("Existing PDF bookmarks: {existing_count}");
-    println!("Existing bookmark policy: {policy:?}");
+    if from_zero {
+        println!("Existing bookmark policy: FromZero");
+    } else {
+        println!("Existing bookmark policy: {policy:?}");
+    }
     if paths.input == paths.output {
         println!("Would replace input PDF: {}", paths.input.display());
     } else {
@@ -398,8 +415,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         return export_bookmarks(&paths.input, &paths.output);
     }
 
-    let policy = cli.on_existing;
+    let policy = cli.existing_policy();
     let dry_run = cli.dry_run;
+    let from_zero = cli.from_zero;
     let paths = cli.paths()?;
     let mut document = Document::load(&paths.input)?;
     let pages = document.get_pages();
@@ -408,11 +426,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let contents = fs::read_to_string(&paths.bookmarks)?;
     let report = analyze_entries(&contents, max_page);
     if dry_run {
-        print_dry_run_report(&paths, max_page, existing.len(), &report, policy);
+        print_dry_run_report(&paths, max_page, existing.len(), &report, policy, from_zero);
         return Ok(());
     }
 
     let entries = report.entries;
+    let existing = if from_zero { Vec::new() } else { existing };
     add_bookmarks(&mut document, existing, entries, &pages, policy)?;
     save_document(&mut document, &paths.input, &paths.output)?;
     println!("Wrote {}", paths.output.display());
@@ -560,14 +579,47 @@ mod tests {
             Cli::try_parse_from(["sbm", "book", "--in-place", "--output", "other.pdf"]).is_err()
         );
         assert_eq!(
-            Cli::try_parse_from(["sbm", "book"]).unwrap().on_existing,
+            Cli::try_parse_from(["sbm", "book"])
+                .unwrap()
+                .existing_policy(),
             ExistingPolicy::Create
         );
         assert_eq!(
             Cli::try_parse_from(["sbm", "book", "--on-existing", "update"])
                 .unwrap()
-                .on_existing,
+                .existing_policy(),
             ExistingPolicy::Update
+        );
+        assert_eq!(
+            Cli::try_parse_from(["sbm", "book", "--in-place"])
+                .unwrap()
+                .existing_policy(),
+            ExistingPolicy::Update
+        );
+        assert_eq!(
+            Cli::try_parse_from(["sbm", "book", "--in-place", "--on-existing", "create"])
+                .unwrap()
+                .existing_policy(),
+            ExistingPolicy::Create
+        );
+        assert_eq!(
+            Cli::try_parse_from(["sbm", "book", "--in-place", "--on-existing", "update"])
+                .unwrap()
+                .existing_policy(),
+            ExistingPolicy::Update
+        );
+    }
+
+    #[test]
+    fn parses_from_zero_and_rejects_irrelevant_options() {
+        assert!(
+            Cli::try_parse_from(["sbm", "book", "--from-zero"])
+                .unwrap()
+                .from_zero
+        );
+        assert!(Cli::try_parse_from(["sbm", "book", "--from-zero", "--export"]).is_err());
+        assert!(
+            Cli::try_parse_from(["sbm", "book", "--from-zero", "--on-existing", "update"]).is_err()
         );
     }
 
@@ -724,5 +776,29 @@ mod tests {
         assert!(toc.iter().any(|item| item.title == "Old parent"));
         assert!(toc.iter().any(|item| item.title == "New parent"));
         assert!(toc.iter().any(|item| item.title == "Old child"));
+    }
+
+    #[test]
+    fn rebuilds_bookmarks_from_zero_without_existing_entries() {
+        let mut document = document_with_existing_outlines();
+        let pages = document.get_pages();
+
+        add_bookmarks(
+            &mut document,
+            Vec::new(),
+            vec![Entry {
+                page: 2,
+                title: "Only new bookmark".to_string(),
+                depth: 0,
+            }],
+            &pages,
+            ExistingPolicy::Create,
+        )
+        .unwrap();
+
+        let toc = document.get_toc().unwrap().toc;
+        assert_eq!(toc.len(), 1);
+        assert_eq!(toc[0].title, "Only new bookmark");
+        assert_eq!(toc[0].page, 2);
     }
 }

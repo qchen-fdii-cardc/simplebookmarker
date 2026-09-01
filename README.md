@@ -68,7 +68,18 @@ sbm book --on-existing update
 
 Update mode matches existing same-page bookmarks once each, in document order.
 It keeps their hierarchy and changes only their titles. If no unmatched
-bookmark exists on that page, a new bookmark is created.
+bookmark exists on that page, a new bookmark is created. In-place mode defaults
+to update unless `--on-existing` is set explicitly.
+
+To discard all existing PDF bookmarks before adding bookmarks from the text
+file, run:
+
+```console
+sbm book --from-zero
+```
+
+`--from-zero` cannot be combined with `--on-existing` because existing
+bookmarks are not preserved.
 
 Input, bookmark, and output paths can also be set explicitly:
 
